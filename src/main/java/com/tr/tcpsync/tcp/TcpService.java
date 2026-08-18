@@ -5,6 +5,7 @@ import com.tr.tcpsync.sdk.TcpClient;
 import com.tr.tcpsync.sdk.TcpConnectionInfo;
 import com.tr.tcpsync.sdk.TcpTransportEngine;
 import com.tr.tcpsync.sdk.TcpTransportException;
+import com.tr.tcpsync.support.ResponseExchanger;
 import com.tr.tcpsync.ws.HealthWebSocketHandler;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -15,10 +16,7 @@ import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Our implementation of the external SDK's {@link TcpClient} contract.
@@ -43,11 +41,10 @@ public class TcpService implements TcpClient {
     private final HealthWebSocketHandler webSocketHandler;
 
     /**
-     * Requests waiting for their correlated reply. Keyed by correlationId so a
-     * reply arriving on the transport thread can hand the DTO back to the HTTP
-     * thread that is blocked in {@link #exchange}.
+     * Matches asynchronous TCP replies to the HTTP requests waiting for them,
+     * by correlationId. All the CompletableFuture bookkeeping lives here.
      */
-    private final Map<String, CompletableFuture<HealthStatusDto>> pending = new ConcurrentHashMap<>();
+    private final ResponseExchanger<HealthStatusDto> exchanger = new ResponseExchanger<>();
 
     @Value("${tcp.host:127.0.0.1}")
     private String host;
@@ -97,6 +94,8 @@ public class TcpService implements TcpClient {
     public void disconnect() {
         log.info("Disconnecting from TCP peer {}:{}", host, port);
         transport.disconnect();
+        // Nobody will answer now — fail waiters instead of letting them time out.
+        exchanger.failAll(new TcpTransportException("connection closed"));
     }
 
     @Override
@@ -130,19 +129,14 @@ public class TcpService implements TcpClient {
      * </ul>
      */
     public CompletableFuture<HealthStatusDto> exchange(String correlationId, byte[] payload, Duration timeout) {
-        CompletableFuture<HealthStatusDto> future = new CompletableFuture<>();
         // Register BEFORE sending so we never miss a very fast reply.
-        pending.put(correlationId, future);
-        // Whatever the outcome (reply, timeout, send error), drop the entry.
-        future.whenComplete((reply, error) -> pending.remove(correlationId));
+        CompletableFuture<HealthStatusDto> future = exchanger.register(correlationId, timeout);
         try {
             sendMessage(payload);
         } catch (RuntimeException e) {
-            future.completeExceptionally(e);
-            return future;
+            exchanger.completeExceptionally(correlationId, e);
         }
-        // No thread is parked: orTimeout schedules completion on a shared timer.
-        return future.orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        return future;
     }
 
     /**
@@ -158,16 +152,13 @@ public class TcpService implements TcpClient {
         log.debug("Received {} bytes from TCP peer: {}", data.length, frame);
         HealthStatusDto dto = parseFrame(frame);
 
-        // Hand the reply to the blocked HTTP thread, if any.
-        CompletableFuture<HealthStatusDto> waiter = pending.get(dto.correlationId());
-        if (waiter != null) {
-            waiter.complete(dto);
-        }
+        // Hand the reply to the HTTP request waiting on this correlationId, if any.
+        boolean matched = exchanger.complete(dto.correlationId(), dto);
 
         // Also push to any WebSocket subscribers (kept for the async channel).
         webSocketHandler.broadcast(dto);
         log.info("Delivered health status '{}' (correlationId={}, awaited={}) to {} ws client(s)",
-                dto.status(), dto.correlationId(), waiter != null, webSocketHandler.connectedClients());
+                dto.status(), dto.correlationId(), matched, webSocketHandler.connectedClients());
     }
 
     @Override
